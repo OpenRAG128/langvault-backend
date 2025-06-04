@@ -9,3 +9,4 @@ gunicorn
 pdfplumber
 PyMuPDF
 flask-cors
+python-docx
