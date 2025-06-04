@@ -430,6 +430,10 @@ def create_professional_pdf(original_pdf_bytes, translated_pages, original_pages
         logger.error(f"Error creating PDF: {str(e)}")
         raise
 
+@app.route("/ping")
+def index():
+    return "Backend is running"
+    
 @app.route('/', methods=['GET', 'POST'])
 def index():
     global translated_content_cache
