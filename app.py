@@ -1,573 +1,559 @@
-from flask import Flask, render_template, request, send_file, jsonify
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import io, os
 import pdfplumber
-import fitz  # PyMuPDF
+import docx
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from generation_utils import should_skip_page, build_prompt, clean_translation
 import logging
 from datetime import datetime
+import uuid
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+
+# Enable CORS for cross-origin requests from Vercel frontend
+CORS(app, origins=["*"])  # Configure with your Vercel domain in production
+
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging for Azure
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Global cache for translated content
-translated_content_cache = {
-    "text": "",
-    "pages": [],
-    "original_pages": [],
-    "metadata": {}
+# In-memory cache with session management (consider Redis for production)
+translation_sessions = {}
+
+# Configuration
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt'}
+SUPPORTED_LANGUAGES = {
+    'hindi', 'marathi', 'bengali', 'telugu', 'tamil', 'kannada', 'malayalam',
+    'punjabi', 'gujarati', 'oriya', 'assamese', 'urdu', 'sanskrit', 'maithili',
+    'konkani', 'manipuri', 'kashmiri', 'sindhi', 'dogri', 'bodo', 'santhali',
+    'french', 'spanish', 'german', 'italian', 'portuguese', 'russian',
+    'chinese', 'japanese', 'korean', 'arabic'
 }
 
-def extract_text_with_metadata(pdf_bytes):
-    """Extract text and metadata from PDF pages"""
-    text_pages = []
-    metadata = []
-    
+def allowed_file(filename):
+    """Check if file extension is allowed"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def validate_language(language):
+    """Validate target language"""
+    return language and language.lower() in SUPPORTED_LANGUAGES
+
+def extract_text_from_pdf(file_bytes):
+    """Extract text from PDF file"""
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            doc_info = {
-                "total_pages": len(pdf.pages),
-                "creation_date": datetime.now().isoformat()
-            }
-            
+        text_content = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text()
-                page_text = text or ""
-                text_pages.append(page_text)
-                
-                # Extract page metadata
-                page_meta = {
-                    "page_number": i + 1,
-                    "char_count": len(page_text),
-                    "word_count": len(page_text.split()) if page_text else 0,
-                    "bbox": page.bbox if hasattr(page, 'bbox') else None
+                if text and text.strip():
+                    text_content.append({
+                        "page": i + 1,
+                        "content": text.strip()
+                    })
+        return text_content
+    except Exception as e:
+        logger.error(f"Error extracting PDF text: {str(e)}")
+        raise ValueError(f"Failed to extract text from PDF: {str(e)}")
+
+def extract_text_from_docx(file_bytes):
+    """Extract text from DOCX file"""
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+        text_content = []
+        current_page = 1
+        page_text = ""
+        
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                page_text += paragraph.text.strip() + "\n"
+                # Simple page break detection (could be improved)
+                if len(page_text) > 2000:  # Approximate page break
+                    text_content.append({
+                        "page": current_page,
+                        "content": page_text.strip()
+                    })
+                    current_page += 1
+                    page_text = ""
+        
+        # Add remaining text
+        if page_text.strip():
+            text_content.append({
+                "page": current_page,
+                "content": page_text.strip()
+            })
+        
+        return text_content
+    except Exception as e:
+        logger.error(f"Error extracting DOCX text: {str(e)}")
+        raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
+
+def extract_text_from_txt(file_bytes):
+    """Extract text from TXT file"""
+    try:
+        # Try different encodings
+        encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
+        text = None
+        
+        for encoding in encodings:
+            try:
+                text = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if text is None:
+            raise ValueError("Unable to decode text file with supported encodings")
+        
+        # Split into chunks for better processing
+        text_content = []
+        chunks = text.split('\n\n')  # Split by double newlines
+        current_page = 1
+        page_text = ""
+        
+        for chunk in chunks:
+            if chunk.strip():
+                page_text += chunk.strip() + "\n\n"
+                # Create pages of reasonable size
+                if len(page_text) > 2000:
+                    text_content.append({
+                        "page": current_page,
+                        "content": page_text.strip()
+                    })
+                    current_page += 1
+                    page_text = ""
+        
+        # Add remaining text
+        if page_text.strip():
+            text_content.append({
+                "page": current_page,
+                "content": page_text.strip()
+            })
+        
+        return text_content
+    except Exception as e:
+        logger.error(f"Error extracting TXT text: {str(e)}")
+        raise ValueError(f"Failed to extract text from TXT: {str(e)}")
+
+def extract_text_with_metadata(file_bytes, file_extension):
+    """Extract text and metadata from different file types"""
+    try:
+        if file_extension == 'pdf':
+            text_content = extract_text_from_pdf(file_bytes)
+        elif file_extension == 'docx':
+            text_content = extract_text_from_docx(file_bytes)
+        elif file_extension == 'txt':
+            text_content = extract_text_from_txt(file_bytes)
+        else:
+            raise ValueError(f"Unsupported file type: {file_extension}")
+        
+        # Create metadata
+        total_chars = sum(len(item['content']) for item in text_content)
+        total_words = sum(len(item['content'].split()) for item in text_content)
+        
+        metadata = {
+            "document": {
+                "total_pages": len(text_content),
+                "total_characters": total_chars,
+                "total_words": total_words,
+                "file_type": file_extension.upper(),
+                "creation_date": datetime.now().isoformat(),
+                "file_size": len(file_bytes)
+            },
+            "pages": [
+                {
+                    "page_number": item['page'],
+                    "char_count": len(item['content']),
+                    "word_count": len(item['content'].split())
                 }
-                metadata.append(page_meta)
-                
-        return text_pages, {"document": doc_info, "pages": metadata}
+                for item in text_content
+            ]
+        }
+        
+        return [item['content'] for item in text_content], metadata
+        
     except Exception as e:
         logger.error(f"Error extracting text: {str(e)}")
-        raise
+        raise ValueError(f"Failed to extract text: {str(e)}")
 
-def create_professional_pdf(original_pdf_bytes, translated_pages, original_pages, target_language):
-    """Create a professional-looking bilingual PDF with proper formatting and Unicode support"""
-    try:
-        doc = fitz.open(stream=original_pdf_bytes, filetype="pdf")
-        new_doc = fitz.open()  # Create new document for better control
-        
-        # Define styling constants
-        MARGIN = 40
-        HEADER_HEIGHT = 60
-        FOOTER_HEIGHT = 40
-        COLUMN_GAP = 20
-        
-        def safe_text_encode(text):
-            """Safely encode text to handle Unicode characters"""
-            if not text:
-                return ""
-            try:
-                # Try to handle various encodings
-                if isinstance(text, bytes):
-                    text = text.decode('utf-8', errors='replace')
-                # Replace problematic characters that might not render
-                text = text.replace('\u00a0', ' ')  # Non-breaking space
-                text = text.replace('\ufeff', '')   # BOM
-                return text
-            except Exception as e:
-                logger.warning(f"Text encoding issue: {e}")
-                return str(text)
-        
-        def get_unicode_safe_font():
-            """Get fonts that can handle Unicode characters better"""
-            # For Unicode support, we'll use basic fonts and handle encoding properly
-            return "helv"  # Use basic Helvetica as it's most reliable
-        
-        def insert_text_safely(page, point_or_rect, text, fontname="helv", fontsize=10, color=(0,0,0), align=None):
-            """Safely insert text with proper encoding and error handling"""
-            try:
-                safe_text = safe_text_encode(text)
-                if isinstance(point_or_rect, fitz.Rect) and align:
-                    # Use textbox for alignment
-                    return page.insert_textbox(point_or_rect, safe_text, 
-                                             fontname=fontname, fontsize=fontsize, 
-                                             color=color, align=align)
-                else:
-                    # Use simple text insertion
-                    if isinstance(point_or_rect, fitz.Rect):
-                        point = (point_or_rect.x0 + 5, point_or_rect.y0 + 15)
-                    else:
-                        point = point_or_rect
-                    return page.insert_text(point, safe_text, 
-                                          fontname=fontname, fontsize=fontsize, color=color)
-            except Exception as e:
-                logger.warning(f"Text insertion failed: {e}")
-                # Fallback: insert error message
-                try:
-                    error_text = "[Text rendering error - check character encoding]"
-                    if isinstance(point_or_rect, fitz.Rect):
-                        point = (point_or_rect.x0 + 5, point_or_rect.y0 + 15)
-                    else:
-                        point = point_or_rect
-                    return page.insert_text(point, error_text, 
-                                          fontname="helv", fontsize=fontsize, color=(0.8,0,0))
-                except:
-                    return None
-        
-        # Get working font
-        regular_font = get_unicode_safe_font()
-        bold_font = regular_font
-        italic_font = regular_font
-        
-        # Language labels
-        lang_labels = {
-    "hindi": "Hindi Translation",
-    "marathi": "Marathi Translation",
-    "bengali": "Bengali Translation",
-    "telugu": "Telugu Translation",
-    "tamil": "Tamil Translation",
-    "kannada": "Kannada Translation",
-    "malayalam": "Malayalam Translation",
-    "punjabi": "Punjabi Translation",
-    "gujarati": "Gujarati Translation",
-    "oriya": "Odia Translation",
-    "assamese": "Assamese Translation",
-    "urdu": "Urdu Translation",
-    "sanskrit": "Sanskrit Translation",
-    "maithili": "Maithili Translation",
-    "konkani": "Konkani Translation",
-    "manipuri": "Manipuri Translation",
-    "kashmiri": "Kashmiri Translation",
-    "sindhi": "Sindhi Translation",
-    "dogri": "Dogri Translation",
-    "bodo": "Bodo Translation",
-    "santhali": "Santhali Translation",
-    "french": "French Translation",
-    "spanish": "Spanish Translation",
-    "german": "German Translation",
-    "italian": "Italian Translation",
-    "portuguese": "Portuguese Translation",
-    "russian": "Russian Translation",
-    "chinese": "Chinese Translation",
-    "japanese": "Japanese Translation",
-    "korean": "Korean Translation",
-    "arabic": "Arabic Translation"
-    }
-
-        
-        original_label = "Original Text"
-        translated_label = lang_labels.get(target_language.lower(), f"{target_language.title()} Translation")
-        
-        for page_num, (original_text, translated_text) in enumerate(zip(original_pages, translated_pages)):
-            # Create new page with A4 dimensions
-            new_page = new_doc.new_page(width=595, height=842)  # A4 size
-            page_rect = new_page.rect
-            
-            # Calculate content area
-            content_rect = fitz.Rect(
-                MARGIN, 
-                MARGIN + HEADER_HEIGHT, 
-                page_rect.width - MARGIN, 
-                page_rect.height - MARGIN - FOOTER_HEIGHT
-            )
-            
-            # Draw header
-            header_rect = fitz.Rect(MARGIN, MARGIN, page_rect.width - MARGIN, MARGIN + HEADER_HEIGHT - 10)
-            new_page.draw_rect(header_rect, color=(0.9, 0.9, 0.9), fill=True)
-            
-            # Add title with safe encoding
-            title_text = f"Bilingual Document Translation - Page {page_num + 1}"
-            insert_text_safely(
-                new_page, 
-                fitz.Rect(MARGIN + 10, MARGIN + 10, page_rect.width - MARGIN - 10, MARGIN + 35),
-                title_text,
-                fontname=bold_font,
-                fontsize=14,
-                color=(0.2, 0.2, 0.2),
-                align=fitz.TEXT_ALIGN_CENTER
-            )
-            
-            # Calculate column widths
-            column_width = (content_rect.width - COLUMN_GAP) / 2
-            
-            # Left column (Original)
-            left_col_rect = fitz.Rect(
-                content_rect.x0,
-                content_rect.y0,
-                content_rect.x0 + column_width,
-                content_rect.y1
-            )
-            
-            # Right column (Translation)
-            right_col_rect = fitz.Rect(
-                content_rect.x0 + column_width + COLUMN_GAP,
-                content_rect.y0,
-                content_rect.x1,
-                content_rect.y1
-            )
-            
-            # Draw column separators
-            new_page.draw_line(
-                fitz.Point(content_rect.x0 + column_width + COLUMN_GAP/2, content_rect.y0),
-                fitz.Point(content_rect.x0 + column_width + COLUMN_GAP/2, content_rect.y1),
-                color=(0.8, 0.8, 0.8),
-                width=1
-            )
-            
-            # Add column headers with safe encoding
-            header_y = content_rect.y0 + 5
-            insert_text_safely(
-                new_page,
-                fitz.Rect(left_col_rect.x0, header_y, left_col_rect.x1, header_y + 20),
-                original_label,
-                fontname=bold_font,
-                fontsize=12,
-                color=(0.3, 0.3, 0.3),
-                align=fitz.TEXT_ALIGN_CENTER
-            )
-            
-            insert_text_safely(
-                new_page,
-                fitz.Rect(right_col_rect.x0, header_y, right_col_rect.x1, header_y + 20),
-                translated_label,
-                fontname=bold_font,
-                fontsize=12,
-                color=(0.1, 0.5, 0.1),
-                align=fitz.TEXT_ALIGN_CENTER
-            )
-            
-            # Content areas (with padding)
-            content_padding = 10
-            left_content_rect = fitz.Rect(
-                left_col_rect.x0 + content_padding,
-                left_col_rect.y0 + 30,
-                left_col_rect.x1 - content_padding,
-                left_col_rect.y1 - content_padding
-            )
-            
-            right_content_rect = fitz.Rect(
-                right_col_rect.x0 + content_padding,
-                right_col_rect.y0 + 30,
-                right_col_rect.x1 - content_padding,
-                right_col_rect.y1 - content_padding
-            )
-            
-            # Insert original text with safe encoding
-            if original_text and not should_skip_page(original_text):
-                # Clean and format original text
-                clean_original = safe_text_encode(original_text.strip()[:1800])  # Limit text length
-                
-                # Split text into manageable chunks for better rendering
-                words = clean_original.split()
-                lines = []
-                current_line = ""
-                max_chars_per_line = 50
-                
-                for word in words:
-                    test_line = current_line + " " + word if current_line else word
-                    if len(test_line) <= max_chars_per_line:
-                        current_line = test_line
-                    else:
-                        if current_line:
-                            lines.append(current_line)
-                        current_line = word
-                if current_line:
-                    lines.append(current_line)
-                
-                # Insert lines with proper spacing
-                y_pos = left_content_rect.y0 + 15
-                line_height = 12
-                max_lines = min(len(lines), 30)  # Limit lines to prevent overflow
-                
-                for i in range(max_lines):
-                    if y_pos + line_height > left_content_rect.y1:
-                        break
-                    insert_text_safely(
-                        new_page,
-                        (left_content_rect.x0, y_pos),
-                        lines[i],
-                        fontname=regular_font,
-                        fontsize=9,
-                        color=(0.1, 0.1, 0.1)
-                    )
-                    y_pos += line_height
-                    
-                # Add truncation notice if needed
-                if len(lines) > max_lines:
-                    insert_text_safely(
-                        new_page,
-                        (left_content_rect.x0, y_pos),
-                        "[... text truncated for display ...]",
-                        fontname=italic_font,
-                        fontsize=8,
-                        color=(0.5, 0.5, 0.5)
-                    )
-            else:
-                insert_text_safely(
-                    new_page,
-                    (left_content_rect.x0 + 50, left_content_rect.y0 + 100),
-                    "[No meaningful content to display]",
-                    fontname=italic_font,
-                    fontsize=9,
-                    color=(0.6, 0.6, 0.6)
-                )
-            
-            # Insert translated text with safe encoding and Unicode handling
-            if translated_text and not translated_text.startswith("[Skipped:"):
-                # Clean and format translated text with special attention to Unicode
-                clean_translated = safe_text_encode(clean_translation(translated_text).strip()[:1800])
-                
-                # For non-Latin scripts, provide additional handling
-                if target_language.lower() in ['hindi', 'arabic', 'chinese', 'japanese', 'korean', 'russian']:
-                    # For complex scripts, we'll use a different approach
-                    # Split by sentences rather than words for better rendering
-                    sentences = clean_translated.replace('।', '।\n').replace('。', '。\n').replace('.', '.\n').split('\n')
-                    lines = []
-                    
-                    for sentence in sentences[:20]:  # Limit sentences
-                        sentence = sentence.strip()
-                        if sentence:
-                            # Break long sentences into chunks
-                            if len(sentence) > 60:
-                                words = sentence.split()
-                                current_line = ""
-                                for word in words:
-                                    if len(current_line + " " + word) <= 60:
-                                        current_line += " " + word if current_line else word
-                                    else:
-                                        if current_line:
-                                            lines.append(current_line)
-                                        current_line = word
-                                if current_line:
-                                    lines.append(current_line)
-                            else:
-                                lines.append(sentence)
-                else:
-                    # For Latin scripts, use word-based wrapping
-                    words = clean_translated.split()
-                    lines = []
-                    current_line = ""
-                    max_chars_per_line = 50
-                    
-                    for word in words:
-                        test_line = current_line + " " + word if current_line else word
-                        if len(test_line) <= max_chars_per_line:
-                            current_line = test_line
-                        else:
-                            if current_line:
-                                lines.append(current_line)
-                            current_line = word
-                    if current_line:
-                        lines.append(current_line)
-                
-                # Insert lines with proper spacing
-                y_pos = right_content_rect.y0 + 15
-                line_height = 12
-                max_lines = min(len(lines), 30)  # Limit lines to prevent overflow
-                
-                for i in range(max_lines):
-                    if y_pos + line_height > right_content_rect.y1:
-                        break
-                    insert_text_safely(
-                        new_page,
-                        (right_content_rect.x0, y_pos),
-                        lines[i],
-                        fontname=regular_font,
-                        fontsize=9,
-                        color=(0.1, 0.4, 0.1)
-                    )
-                    y_pos += line_height
-                    
-                # Add truncation notice if needed
-                if len(lines) > max_lines:
-                    insert_text_safely(
-                        new_page,
-                        (right_content_rect.x0, y_pos),
-                        "[... translation truncated for display ...]",
-                        fontname=italic_font,
-                        fontsize=8,
-                        color=(0.5, 0.5, 0.5)
-                    )
-                    
-            else:
-                skip_message = translated_text if translated_text.startswith("[Skipped:") else "[Translation not available]"
-                insert_text_safely(
-                    new_page,
-                    (right_content_rect.x0 + 50, right_content_rect.y0 + 100),
-                    skip_message,
-                    fontname=italic_font,
-                    fontsize=9,
-                    color=(0.6, 0.6, 0.6)
-                )
-            
-            # Add footer with safe encoding
-            footer_text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')} | Page {page_num + 1} of {len(original_pages)}"
-            insert_text_safely(
-                new_page,
-                fitz.Rect(MARGIN, page_rect.height - MARGIN - 20, page_rect.width - MARGIN, page_rect.height - MARGIN),
-                footer_text,
-                fontname=regular_font,
-                fontsize=8,
-                color=(0.5, 0.5, 0.5),
-                align=fitz.TEXT_ALIGN_CENTER
-            )
-        
-        # Save to bytes
-        pdf_bytes = io.BytesIO()
-        new_doc.save(pdf_bytes)
-        new_doc.close()
-        doc.close()
-        pdf_bytes.seek(0)
-        
-        return pdf_bytes
-        
-    except Exception as e:
-        logger.error(f"Error creating PDF: {str(e)}")
-        raise
-
-@app.route("/ping")
-def ping():
-    return "Backend is running"
+def translate_text_batch(pages, target_language, llm):
+    """Translate multiple pages efficiently"""
+    translated_pages = []
     
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    global translated_content_cache
-
-    if request.method == 'POST':
+    for i, text in enumerate(pages):
+        logger.info(f"Translating page {i+1}/{len(pages)}")
+        
+        if should_skip_page(text):
+            translated_pages.append("[Skipped: Insufficient meaningful content]")
+            continue
+        
         try:
-            file = request.files.get('file')
-            lang = request.form.get('language')
-            
-            if not file or not lang:
-                return render_template("index.html", error="Please upload a PDF file and select a target language.")
-
-            if not file.filename.lower().endswith('.pdf'):
-                return render_template("index.html", error="Please upload a valid PDF file.")
-
-            logger.info(f"Processing file: {file.filename}, Target language: {lang}")
-            
-            # Read PDF
-            pdf_bytes = file.read()
-            if len(pdf_bytes) == 0:
-                return render_template("index.html", error="The uploaded file is empty.")
-            
-            # Extract text and metadata
-            pages, metadata = extract_text_with_metadata(pdf_bytes)
-            
-            if not pages:
-                return render_template("index.html", error="No text content found in the PDF.")
-            
-            # Initialize LLM
-            llm = ChatGroq(model="gemma2-9b-it", temperature=0, api_key=GROQ_API_KEY)
-            translated_pages = []
-            
-            logger.info(f"Translating {len(pages)} pages to {lang}")
-            
-            # Translate pages
-            for i, text in enumerate(pages):
-                logger.info(f"Processing page {i+1}/{len(pages)}")
-                
-                if should_skip_page(text):
-                    translated_pages.append("[Skipped: Page contains insufficient meaningful content for translation]")
-                    continue
-
-                try:
-                    prompt = build_prompt(text, lang)
-                    result = llm.predict(prompt)
-                    cleaned_result = clean_translation(result.strip())
-                    translated_pages.append(cleaned_result)
-                except Exception as e:
-                    logger.error(f"Translation error for page {i+1}: {str(e)}")
-                    translated_pages.append(f"[Translation Error: {str(e)}]")
-
-            # Cache results
-            translated_content_cache = {
-                "text": '\n\n'.join(translated_pages),
-                "pages": translated_pages,
-                "original_pages": pages,
-                "metadata": metadata,
-                "target_language": lang,
-                "pdf_bytes": pdf_bytes
-            }
-            
-            logger.info("Translation completed successfully")
-            
-            return render_template("index.html",
-                                   translated_text=translated_content_cache["text"],
-                                   page_count=len(translated_pages),
-                                   target_language=lang.title(),
-                                   success_message=f"Successfully translated {len(pages)} pages to {lang.title()}!")
-
+            prompt = build_prompt(text, target_language)
+            result = llm.predict(prompt)
+            cleaned_result = clean_translation(result.strip())
+            translated_pages.append(cleaned_result)
         except Exception as e:
-            logger.error(f"Translation process failed: {str(e)}")
-            return render_template("index.html", error=f"Translation failed: {str(e)}")
-
-    return render_template("index.html")
-
-@app.route('/download_pdf')
-def download_pdf():
-    global translated_content_cache
+            logger.error(f"Translation error for page {i+1}: {str(e)}")
+            translated_pages.append(f"[Translation Error: {str(e)}]")
     
-    try:
-        if not translated_content_cache.get("pages"):
-            return jsonify({"error": "No translated content available. Please translate a document first."}), 400
-        
-        logger.info("Generating PDF download")
-        
-        # Generate optimized PDF
-        pdf_bytes = create_professional_pdf(
-            translated_content_cache["pdf_bytes"],
-            translated_content_cache["pages"],
-            translated_content_cache["original_pages"],
-            translated_content_cache["target_language"]
-        )
-        
-        # Save to file
-        output_filename = f"bilingual_translation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        output_path = os.path.join(os.getcwd(), output_filename)
-        
-        with open(output_path, "wb") as f:
-            f.write(pdf_bytes.read())
-        
-        logger.info(f"PDF saved as {output_filename}")
-        
-        return send_file(
-            output_path, 
-            as_attachment=True, 
-            download_name=output_filename,
-            mimetype='application/pdf'
-        )
-        
-    except Exception as e:
-        logger.error(f"PDF download failed: {str(e)}")
-        return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
+    return translated_pages
 
-@app.route('/api/translation_status')
-def translation_status():
-    """API endpoint to check if translation is available"""
-    global translated_content_cache
-    
-    has_translation = bool(translated_content_cache.get("pages"))
-    
+# API Routes
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Azure deployment"""
     return jsonify({
-        "has_translation": has_translation,
-        "page_count": len(translated_content_cache.get("pages", [])),
-        "target_language": translated_content_cache.get("target_language", ""),
-        "metadata": translated_content_cache.get("metadata", {})
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "2.0.0",
+        "supported_formats": list(ALLOWED_EXTENSIONS),
+        "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024)
     })
 
+@app.route('/api/languages', methods=['GET'])
+def get_supported_languages():
+    """Get list of supported languages"""
+    return jsonify({
+        "languages": sorted(list(SUPPORTED_LANGUAGES)),
+        "count": len(SUPPORTED_LANGUAGES)
+    })
+
+@app.route('/api/translate', methods=['POST'])
+def translate_document():
+    """Upload and translate document in one step"""
+    try:
+        # Validate request
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        if 'language' not in request.form:
+            return jsonify({"error": "Target language not specified"}), 400
+        
+        file = request.files['file']
+        target_language = request.form['language'].lower().strip()
+        
+        # Validate file
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({
+                "error": "Invalid file type. Supported formats: PDF, DOCX, TXT",
+                "supported_formats": list(ALLOWED_EXTENSIONS)
+            }), 400
+        
+        # Validate language
+        if not validate_language(target_language):
+            return jsonify({
+                "error": f"Unsupported language: {target_language}",
+                "supported_languages": sorted(list(SUPPORTED_LANGUAGES))
+            }), 400
+        
+        # Get file extension
+        file_extension = file.filename.rsplit('.', 1)[1].lower()
+        
+        # Read and validate file
+        file_bytes = file.read()
+        if len(file_bytes) == 0:
+            return jsonify({"error": "Empty file uploaded"}), 400
+        
+        if len(file_bytes) > MAX_FILE_SIZE:
+            return jsonify({
+                "error": f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+            }), 400
+        
+        # Extract text
+        logger.info(f"Processing file: {secure_filename(file.filename)}, Language: {target_language}")
+        pages, metadata = extract_text_with_metadata(file_bytes, file_extension)
+        
+        if not pages:
+            return jsonify({"error": "No text content found in the document"}), 400
+        
+        # Initialize LLM
+        if not GROQ_API_KEY:
+            return jsonify({"error": "Translation service not configured"}), 500
+        
+        llm = ChatGroq(model="gemma2-9b-it", temperature=0, api_key=GROQ_API_KEY)
+        
+        # Translate document
+        logger.info(f"Starting translation of {len(pages)} pages to {target_language}")
+        translated_pages = translate_text_batch(pages, target_language, llm)
+        
+        # Prepare response
+        translation_id = str(uuid.uuid4())
+        
+        # Calculate translation statistics
+        total_original_chars = sum(len(page) for page in pages)
+        total_translated_chars = sum(len(page) for page in translated_pages if not page.startswith('['))
+        successful_translations = len([p for p in translated_pages if not p.startswith('[')])
+        
+        response_data = {
+            "translation_id": translation_id,
+            "status": "completed",
+            "original_text": pages,
+            "translated_text": translated_pages,
+            "metadata": metadata,
+            "translation_stats": {
+                "total_pages": len(pages),
+                "successful_translations": successful_translations,
+                "failed_translations": len(pages) - successful_translations,
+                "original_characters": total_original_chars,
+                "translated_characters": total_translated_chars,
+                "target_language": target_language.title(),
+                "source_file_type": file_extension.upper()
+            },
+            "completed_at": datetime.now().isoformat(),
+            "message": f"Successfully translated {successful_translations}/{len(pages)} pages to {target_language.title()}"
+        }
+        
+        logger.info(f"Translation completed successfully. ID: {translation_id}")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Translation failed: {str(e)}")
+        return jsonify({"error": f"Translation failed: {str(e)}"}), 500
+
+@app.route('/api/translate-text', methods=['POST'])
+def translate_text_direct():
+    """Translate text directly without file upload"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        text = data.get('text', '').strip()
+        target_language = data.get('language', '').lower().strip()
+        
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        
+        if not target_language:
+            return jsonify({"error": "Target language not specified"}), 400
+        
+        # Validate language
+        if not validate_language(target_language):
+            return jsonify({
+                "error": f"Unsupported language: {target_language}",
+                "supported_languages": sorted(list(SUPPORTED_LANGUAGES))
+            }), 400
+        
+        # Check text length
+        if len(text) > 10000:  # 10K character limit for direct text
+            return jsonify({"error": "Text too long. Maximum 10,000 characters for direct translation"}), 400
+        
+        # Initialize LLM
+        if not GROQ_API_KEY:
+            return jsonify({"error": "Translation service not configured"}), 500
+        
+        llm = ChatGroq(model="gemma2-9b-it", temperature=0, api_key=GROQ_API_KEY)
+        
+        # Translate text
+        logger.info(f"Translating direct text to {target_language}")
+        
+        try:
+            prompt = build_prompt(text, target_language)
+            result = llm.predict(prompt)
+            translated_text = clean_translation(result.strip())
+        except Exception as e:
+            logger.error(f"Translation error: {str(e)}")
+            return jsonify({"error": f"Translation failed: {str(e)}"}), 500
+        
+        # Prepare response
+        translation_id = str(uuid.uuid4())
+        
+        response_data = {
+            "translation_id": translation_id,
+            "status": "completed",
+            "original_text": text,
+            "translated_text": translated_text,
+            "translation_stats": {
+                "original_characters": len(text),
+                "translated_characters": len(translated_text),
+                "target_language": target_language.title()
+            },
+            "completed_at": datetime.now().isoformat(),
+            "message": f"Text successfully translated to {target_language.title()}"
+        }
+        
+        logger.info(f"Direct text translation completed. ID: {translation_id}")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Direct text translation failed: {str(e)}")
+        return jsonify({"error": f"Translation failed: {str(e)}"}), 500
+
+@app.route('/api/batch-translate', methods=['POST'])
+def batch_translate():
+    """Translate multiple texts in a single request"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        texts = data.get('texts', [])
+        target_language = data.get('language', '').lower().strip()
+        
+        if not texts or not isinstance(texts, list):
+            return jsonify({"error": "No texts array provided"}), 400
+        
+        if len(texts) > 10:  # Limit batch size
+            return jsonify({"error": "Maximum 10 texts per batch"}), 400
+        
+        if not target_language:
+            return jsonify({"error": "Target language not specified"}), 400
+        
+        # Validate language
+        if not validate_language(target_language):
+            return jsonify({
+                "error": f"Unsupported language: {target_language}",
+                "supported_languages": sorted(list(SUPPORTED_LANGUAGES))
+            }), 400
+        
+        # Validate text lengths
+        for i, text in enumerate(texts):
+            if not isinstance(text, str):
+                return jsonify({"error": f"Text {i+1} is not a string"}), 400
+            if len(text) > 5000:  # 5K limit per text in batch
+                return jsonify({"error": f"Text {i+1} too long. Maximum 5,000 characters per text in batch"}), 400
+        
+        # Initialize LLM
+        if not GROQ_API_KEY:
+            return jsonify({"error": "Translation service not configured"}), 500
+        
+        llm = ChatGroq(model="gemma2-9b-it", temperature=0, api_key=GROQ_API_KEY)
+        
+        # Translate texts
+        logger.info(f"Batch translating {len(texts)} texts to {target_language}")
+        translated_texts = []
+        
+        for i, text in enumerate(texts):
+            try:
+                if not text.strip():
+                    translated_texts.append("")
+                    continue
+                    
+                prompt = build_prompt(text, target_language)
+                result = llm.predict(prompt)
+                translated_text = clean_translation(result.strip())
+                translated_texts.append(translated_text)
+            except Exception as e:
+                logger.error(f"Translation error for text {i+1}: {str(e)}")
+                translated_texts.append(f"[Translation Error: {str(e)}]")
+        
+        # Prepare response
+        batch_id = str(uuid.uuid4())
+        
+        response_data = {
+            "batch_id": batch_id,
+            "status": "completed",
+            "results": [
+                {
+                    "index": i,
+                    "original_text": texts[i],
+                    "translated_text": translated_texts[i],
+                    "success": not translated_texts[i].startswith("[Translation Error:")
+                }
+                for i in range(len(texts))
+            ],
+            "translation_stats": {
+                "total_texts": len(texts),
+                "successful_translations": len([t for t in translated_texts if not t.startswith("[Translation Error:")]),
+                "failed_translations": len([t for t in translated_texts if t.startswith("[Translation Error:")]),
+                "target_language": target_language.title()
+            },
+            "completed_at": datetime.now().isoformat(),
+            "message": f"Batch translation completed for {len(texts)} texts"
+        }
+        
+        logger.info(f"Batch translation completed. ID: {batch_id}")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Batch translation failed: {str(e)}")
+        return jsonify({"error": f"Batch translation failed: {str(e)}"}), 500
+
+@app.route('/api/detect-language', methods=['POST'])
+def detect_language():
+    """Detect the language of provided text (basic implementation)"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        text = data.get('text', '').strip()
+        
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        
+        # Simple language detection based on character patterns
+        # This is a basic implementation - consider using a proper language detection library
+        def simple_language_detect(text):
+            # Check for common script patterns
+            if any('\u0900' <= char <= '\u097F' for char in text):
+                return 'hindi'
+            elif any('\u0A00' <= char <= '\u0A7F' for char in text):
+                return 'punjabi'
+            elif any('\u0980' <= char <= '\u09FF' for char in text):
+                return 'bengali'
+            elif any('\u0600' <= char <= '\u06FF' for char in text):
+                return 'arabic'
+            elif any('\u4e00' <= char <= '\u9fff' for char in text):
+                return 'chinese'
+            elif any('\u3040' <= char <= '\u309f' for char in text) or any('\u30a0' <= char <= '\u30ff' for char in text):
+                return 'japanese'
+            elif any('\uac00' <= char <= '\ud7af' for char in text):
+                return 'korean'
+            else:
+                return 'english'  # Default fallback
+        
+        detected_language = simple_language_detect(text)
+        
+        response_data = {
+            "text": text[:100] + "..." if len(text) > 100 else text,
+            "detected_language": detected_language,
+            "confidence": "basic_detection",  # Placeholder since this is a simple implementation
+            "message": f"Detected language: {detected_language.title()}"
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Language detection failed: {str(e)}")
+        return jsonify({"error": f"Language detection failed: {str(e)}"}), 500
+
+# Error handlers
 @app.errorhandler(404)
-def not_found_error(error):
-    return render_template("index.html", error="Page not found."), 404
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return render_template("index.html", error="An internal server error occurred."), 500
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.errorhandler(413)
+def too_large(error):
+    return jsonify({"error": "File too large"}), 413
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({"error": "Method not allowed"}), 405
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # For local development
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
