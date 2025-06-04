@@ -198,7 +198,7 @@ def translate_text_batch(pages, target_language, llm):
         
         try:
             prompt = build_prompt(text, target_language)
-            result = llm.predict(prompt)
+            result = llm.invoke(prompt)
             cleaned_result = clean_translation(result.strip())
             translated_pages.append(cleaned_result)
         except Exception as e:
