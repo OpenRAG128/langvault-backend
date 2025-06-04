@@ -431,7 +431,7 @@ def create_professional_pdf(original_pdf_bytes, translated_pages, original_pages
         raise
 
 @app.route("/ping")
-def index():
+def ping():
     return "Backend is running"
     
 @app.route('/', methods=['GET', 'POST'])
