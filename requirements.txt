@@ -1,0 +1,10 @@
+Flask
+pytesseract
+PyPDF2
+textblob
+langchain-groq
+gTTS
+python-dotenv
+gunicorn
+pdfplumber
+PyMuPDF
