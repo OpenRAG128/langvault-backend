@@ -198,21 +198,9 @@ def translate_text_batch(pages, target_language, llm):
         
         try:
             prompt = build_prompt(text, target_language)
-            
-            # Use invoke() instead of predict() and handle AIMessage object
             result = llm.invoke(prompt)
-            
-            # Extract content from AIMessage object
-            if hasattr(result, 'content'):
-                translated_text = result.content
-            elif hasattr(result, 'text'):
-                translated_text = result.text
-            else:
-                translated_text = str(result)
-            
-            cleaned_result = clean_translation(translated_text.strip())
+            cleaned_result = clean_translation(result.strip())
             translated_pages.append(cleaned_result)
-            
         except Exception as e:
             logger.error(f"Translation error for page {i+1}: {str(e)}")
             translated_pages.append(f"[Translation Error: {str(e)}]")
@@ -380,18 +368,8 @@ def translate_text_direct():
         
         try:
             prompt = build_prompt(text, target_language)
-            result = llm.invoke(prompt)  # Use invoke instead of predict
-            
-            # Extract content from AIMessage object
-            if hasattr(result, 'content'):
-                translated_text = result.content
-            elif hasattr(result, 'text'):
-                translated_text = result.text
-            else:
-                translated_text = str(result)
-                
-            translated_text = clean_translation(translated_text.strip())
-            
+            result = llm.predict(prompt)
+            translated_text = clean_translation(result.strip())
         except Exception as e:
             logger.error(f"Translation error: {str(e)}")
             return jsonify({"error": f"Translation failed: {str(e)}"}), 500
@@ -420,7 +398,6 @@ def translate_text_direct():
     except Exception as e:
         logger.error(f"Direct text translation failed: {str(e)}")
         return jsonify({"error": f"Translation failed: {str(e)}"}), 500
-
 
 @app.route('/api/batch-translate', methods=['POST'])
 def batch_translate():
@@ -474,19 +451,9 @@ def batch_translate():
                     continue
                     
                 prompt = build_prompt(text, target_language)
-                result = llm.invoke(prompt)  # Use invoke instead of predict
-                
-                # Extract content from AIMessage object
-                if hasattr(result, 'content'):
-                    translated_text = result.content
-                elif hasattr(result, 'text'):
-                    translated_text = result.text
-                else:
-                    translated_text = str(result)
-                    
-                translated_text = clean_translation(translated_text.strip())
+                result = llm.predict(prompt)
+                translated_text = clean_translation(result.strip())
                 translated_texts.append(translated_text)
-                
             except Exception as e:
                 logger.error(f"Translation error for text {i+1}: {str(e)}")
                 translated_texts.append(f"[Translation Error: {str(e)}]")
@@ -523,7 +490,6 @@ def batch_translate():
     except Exception as e:
         logger.error(f"Batch translation failed: {str(e)}")
         return jsonify({"error": f"Batch translation failed: {str(e)}"}), 500
-
 
 @app.route('/api/detect-language', methods=['POST'])
 def detect_language():
