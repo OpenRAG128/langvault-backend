@@ -209,6 +209,10 @@ def translate_text_batch(pages, target_language, llm):
 
 # API Routes
 
+@app.route("/")
+def ping():
+    return "Backend is running"
+    
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Azure deployment"""
